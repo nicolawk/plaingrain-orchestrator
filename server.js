@@ -217,7 +217,7 @@ ${message}
  *   category, commodity, region, currency, quantity, unit,
  *   language?: "pl"|"en",
  *   specs: {...},
- *   notes?: string   // if provided and long enough, AI rewrites it professionally
+ *   notes?: string  // if user typed something -> AI rewrites it professionally
  * }
  *
  * Returns:
@@ -247,11 +247,10 @@ app.post("/agent/listing-suggest", verifySecret, async (req, res) => {
       return res.status(400).json({ error: "Missing category or commodity" });
     }
 
-    // Treat notes as "user typed description" if long enough -> rewrite mode
     const userDescription = String(notes || "").trim();
-    const hasUserText = userDescription.length >= 20;
+    const hasUserText = userDescription.length >= 10;
 
-    const input = {
+    const inputFacts = {
       category,
       commodity,
       region,
@@ -260,16 +259,12 @@ app.post("/agent/listing-suggest", verifySecret, async (req, res) => {
       unit,
       language,
       specs,
-      userDescription,
-      hasUserText,
     };
 
-    const system = `
-You are a professional agricultural commodities sales copywriter for the EU/Poland B2B market.
+    const systemRewrite = `
+You are a professional B2B agricultural commodities copywriter.
 
-Return ONLY valid JSON (no markdown, no extra text).
-
-JSON format:
+Return ONLY valid JSON (no markdown, no extra text):
 {
   "description": "string",
   "priceSuggestion": { "value": number, "currency": "PLN|EUR", "unit": "t|kg" },
@@ -277,37 +272,62 @@ JSON format:
   "missingFields": ["string", ...]
 }
 
-DESCRIPTION RULES:
-- Write in Polish if language="pl", otherwise English.
-- The description MUST be 4–8 sentences and read like a real commercial offer (not just specs).
-- Always include:
-  1) 2–3 general sentences about the commodity, quality, and market suitability (easy to read)
-  2) suggested use-cases matching the commodity (e.g., milling / feed / processing / export)
-  3) short specs summary (1–2 sentences max; weave numbers naturally, do not bullet-list)
-  4) logistics/storage readiness (availability, loading, storage conditions, region/location)
-- If hasUserText=true, rewrite userDescription professionally first (keep meaning), then enrich it into a full B2B offer and incorporate key specs.
-
-STRICT:
-- Do NOT invent certifications, guarantees, lab results, origin claims, or “certified” statements unless explicitly present in input.
-- If an important detail is missing (e.g., exact grade, delivery terms), do not guess—add it to missingFields.
+MODE: REWRITE (MANDATORY)
+- You MUST rewrite the user's text into professional language (Polish if language="pl", otherwise English).
+- Keep meaning, improve grammar, structure, and tone.
+- Then enrich it into a complete commercial offer (4–8 sentences).
+- Include: general quality sentences + use-cases + short specs summary (1–2 sentences max) + logistics/readiness + region.
+- Do NOT invent certifications or guarantees.
+- If important info is missing, add it to missingFields (do not guess).
 `.trim();
 
-    const user = `
-TASK:
-Create:
-1) listing description (commercial offer)
-2) price suggestion (per unit)
+    const systemCreate = `
+You are a professional B2B agricultural commodities copywriter.
 
-INPUT:
-${JSON.stringify(input, null, 2)}
+Return ONLY valid JSON (no markdown, no extra text):
+{
+  "description": "string",
+  "priceSuggestion": { "value": number, "currency": "PLN|EUR", "unit": "t|kg" },
+  "confidence": "low|medium|high",
+  "missingFields": ["string", ...]
+}
+
+MODE: CREATE
+- Create a commercial offer description (4–8 sentences), not a spec list.
+- Include: 2–3 general sentences about the commodity and suitability, use-cases, a short specs summary (1–2 sentences max), and logistics/readiness + region.
+- Do NOT invent certifications or guarantees.
+- If important info is missing, add it to missingFields (do not guess).
+`.trim();
+
+    const userPromptRewrite = `
+Rewrite the following USER_TEXT professionally and enrich it into a full listing offer:
+
+USER_TEXT (rewrite this):
+"""
+${userDescription}
+"""
+
+FACTS (use these only; do not invent):
+${JSON.stringify(inputFacts, null, 2)}
+
+Return ONLY JSON.
+`.trim();
+
+    const userPromptCreate = `
+Create a professional listing description + price suggestion from FACTS:
+
+FACTS:
+${JSON.stringify(inputFacts, null, 2)}
+
+Return ONLY JSON.
 `.trim();
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0.45, // higher for better copywriting, still stable
+      temperature: 0.45,
       messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
+        { role: "system", content: hasUserText ? systemRewrite : systemCreate },
+        { role: "user", content: hasUserText ? userPromptRewrite : userPromptCreate },
       ],
     });
 
@@ -326,18 +346,12 @@ ${JSON.stringify(input, null, 2)}
     }
 
     // ---- HARDEN OUTPUT (IMPORTANT for Base44) ----
+    if (!Array.isArray(parsed.missingFields)) parsed.missingFields = [];
 
-    // missingFields must always be an array
-    if (!Array.isArray(parsed.missingFields)) {
-      parsed.missingFields = [];
-    }
-
-    // Normalize confidence
     if (!["low", "medium", "high"].includes(parsed.confidence)) {
       parsed.confidence = "low";
     }
 
-    // Ensure priceSuggestion has correct shape
     const ps = parsed.priceSuggestion;
     const psOk =
       ps &&
@@ -352,15 +366,14 @@ ${JSON.stringify(input, null, 2)}
       parsed.missingFields.push("Price suggestion incomplete");
     }
 
-    // Ensure description is string
     if (typeof parsed.description !== "string") {
       parsed.description = "";
       parsed.confidence = "low";
       parsed.missingFields.push("Description missing");
     }
 
-    // Soft guard: if AI returned too short description, mark low confidence
-    if (parsed.description.trim().length < 140) {
+    // Soft sanity: commercial description should not be ultra-short
+    if (parsed.description.trim().length < 120) {
       parsed.confidence = "low";
       if (!parsed.missingFields.includes("Description too short")) {
         parsed.missingFields.push("Description too short");
