@@ -379,8 +379,24 @@ Return ONLY JSON.
         parsed.missingFields.push("Description too short");
       }
     }
+// ✅ Save this suggestion to DB (AI "memory")
+const saved = await pool.query(
+  `INSERT INTO ai_interactions (user_id, actor, task, input, ai_output)
+   VALUES ($1, $2, $3, $4, $5)
+   RETURNING id`,
+  [
+    req.body.userId || null,     // if Base44 sends it later, great
+    req.body.actor || "user",    // "user" or "admin"
+    "listing_suggest",
+    req.body,
+    parsed
+  ]
+);
 
-    res.json({ success: true, ...parsed });
+// attach interactionId so Base44 can send feedback later
+const interactionId = saved.rows[0]?.id;
+
+res.json({ success: true, interactionId, ...parsed });
   } catch (err) {
     console.error("❌ [LISTING SUGGEST ERROR]", err);
     res.status(500).json({ error: "Listing suggestion failed" });
