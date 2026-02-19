@@ -192,7 +192,8 @@ ${message}
       messages: [
         {
           role: "system",
-          content: "You are an AI assistant for an agricultural commodities marketplace.",
+          content:
+            "You are an AI assistant for an agricultural commodities marketplace.",
         },
         { role: "user", content: context },
       ],
@@ -209,26 +210,37 @@ ${message}
   }
 });
 
-/* ---------------- LISTING AI SUGGEST (NEW) ---------------- */
+/* ---------------- LISTING AI SUGGEST (DESCRIPTION + PRICE) ---------------- */
 /**
- * Purpose:
- * - Base44 sends category + commodity/type + specs from the advert form
- * - We return: description suggestion + price suggestion + confidence
- *
- * Call:
  * POST /agent/listing-suggest
  * Headers: x-pg-secret: <AGENT_ORCHESTRATOR_SECRET>
- * Body: { category, commodity, region, currency, quantity, unit, specs, notes }
+ * Body:
+ * {
+ *   category, commodity, region, currency, quantity, unit,
+ *   language?: "pl"|"en",
+ *   specs: {...},
+ *   notes?: string
+ * }
+ *
+ * Returns:
+ * {
+ *   success: true,
+ *   description: string,
+ *   priceSuggestion: { value: number, currency: "PLN"|"EUR", unit: "t"|"kg" },
+ *   confidence: "low"|"medium"|"high",
+ *   missingFields: string[]
+ * }
  */
 app.post("/agent/listing-suggest", verifySecret, async (req, res) => {
   try {
     const {
       category,
-      commodity, // e.g. "pszenica"
-      region, // e.g. "PL - Mazowieckie"
+      commodity,
+      region,
       currency = "PLN",
       quantity,
       unit = "t",
+      language = "pl",
       specs = {},
       notes = "",
     } = req.body;
@@ -244,13 +256,14 @@ app.post("/agent/listing-suggest", verifySecret, async (req, res) => {
       currency,
       quantity,
       unit,
+      language,
       specs,
       notes,
     };
 
     const system = `
 You are PlainGrain listing assistant.
-Return ONLY valid JSON. No markdown. No extra text.
+Return ONLY valid JSON (no markdown, no extra text).
 
 JSON format:
 {
@@ -261,19 +274,20 @@ JSON format:
 }
 
 Rules:
-- Write a premium, short B2B description (concrete, factual).
-- Suggest a realistic price PER UNIT (e.g. PLN per ton).
-- If not enough data for price, still give an estimate but set confidence to "low" and list missingFields.
-`;
+- Write in Polish if language = "pl", otherwise English.
+- Description must be short, factual, B2B, ready to paste.
+- Suggest a realistic price PER UNIT (e.g., PLN per ton).
+- If not enough data for pricing, still provide an estimate but set confidence="low" and list missingFields.
+`.trim();
 
     const user = `
 Create:
-1) A ready-to-paste listing description
-2) A price suggestion (per unit)
+1) description suggestion
+2) price suggestion (per unit)
 
 INPUT:
 ${JSON.stringify(input, null, 2)}
-`;
+`.trim();
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -298,17 +312,38 @@ ${JSON.stringify(input, null, 2)}
       };
     }
 
-    // Basic hardening in case model returns weird shapes
-    if (
-      !parsed?.priceSuggestion ||
-      typeof parsed.priceSuggestion.value !== "number"
-    ) {
+    // ---- HARDEN OUTPUT (IMPORTANT for Base44) ----
+
+    // missingFields must always be an array
+    if (!Array.isArray(parsed.missingFields)) {
+      parsed.missingFields = [];
+    }
+
+    // Normalize confidence
+    if (!["low", "medium", "high"].includes(parsed.confidence)) {
+      parsed.confidence = "low";
+    }
+
+    // Ensure priceSuggestion has correct shape
+    const ps = parsed.priceSuggestion;
+    const psOk =
+      ps &&
+      typeof ps.value === "number" &&
+      Number.isFinite(ps.value) &&
+      typeof ps.currency === "string" &&
+      typeof ps.unit === "string";
+
+    if (!psOk) {
       parsed.priceSuggestion = { value: 0, currency, unit };
-      parsed.confidence = parsed.confidence || "low";
-      parsed.missingFields = Array.isArray(parsed.missingFields)
-        ? parsed.missingFields
-        : [];
-      parsed.missingFields.push("Valid priceSuggestion.value missing");
+      parsed.confidence = "low";
+      parsed.missingFields.push("Price suggestion incomplete");
+    }
+
+    // Ensure description is string
+    if (typeof parsed.description !== "string") {
+      parsed.description = "";
+      parsed.confidence = "low";
+      parsed.missingFields.push("Description missing");
     }
 
     res.json({ success: true, ...parsed });
