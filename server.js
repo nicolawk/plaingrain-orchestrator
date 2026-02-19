@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -35,13 +36,13 @@ if (!process.env.AGENT_ORCHESTRATOR_SECRET) {
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
 /* ---------------- OPENAI ---------------- */
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 const SECRET = process.env.AGENT_ORCHESTRATOR_SECRET;
@@ -123,6 +124,10 @@ app.post("/sync/user", verifySecret, async (req, res) => {
   try {
     const { eventId, user } = req.body;
 
+    if (!eventId || !user?.id) {
+      return res.status(400).json({ error: "Missing eventId or user" });
+    }
+
     const existing = await pool.query(
       "SELECT 1 FROM ingested_events WHERE event_id=$1",
       [eventId]
@@ -140,11 +145,9 @@ app.post("/sync/user", verifySecret, async (req, res) => {
       [user.id, user]
     );
 
-    await pool.query(
-      // log event
-      "INSERT INTO ingested_events (event_id) VALUES ($1)",
-      [eventId]
-    );
+    await pool.query("INSERT INTO ingested_events (event_id) VALUES ($1)", [
+      eventId,
+    ]);
 
     res.json({ success: true });
   } catch (err) {
@@ -158,6 +161,10 @@ app.post("/sync/user", verifySecret, async (req, res) => {
 app.post("/agent/user-chat", verifySecret, async (req, res) => {
   try {
     const { userId, message } = req.body;
+
+    if (!userId || !message) {
+      return res.status(400).json({ error: "Missing userId or message" });
+    }
 
     const listings = await pool.query(
       "SELECT * FROM listings_ai WHERE seller_user_id=$1",
@@ -183,19 +190,131 @@ ${message}
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "You are an AI assistant for an agricultural commodities marketplace." },
-        { role: "user", content: context }
+        {
+          role: "system",
+          content: "You are an AI assistant for an agricultural commodities marketplace.",
+        },
+        { role: "user", content: context },
       ],
-      temperature: 0.4
+      temperature: 0.4,
     });
 
     res.json({
       response: completion.choices[0].message.content,
-      confidence: "high"
+      confidence: "high",
     });
   } catch (err) {
     console.error("❌ [CHAT ERROR]", err);
     res.status(500).json({ error: "Assistant failed" });
+  }
+});
+
+/* ---------------- LISTING AI SUGGEST (NEW) ---------------- */
+/**
+ * Purpose:
+ * - Base44 sends category + commodity/type + specs from the advert form
+ * - We return: description suggestion + price suggestion + confidence
+ *
+ * Call:
+ * POST /agent/listing-suggest
+ * Headers: x-pg-secret: <AGENT_ORCHESTRATOR_SECRET>
+ * Body: { category, commodity, region, currency, quantity, unit, specs, notes }
+ */
+app.post("/agent/listing-suggest", verifySecret, async (req, res) => {
+  try {
+    const {
+      category,
+      commodity, // e.g. "pszenica"
+      region, // e.g. "PL - Mazowieckie"
+      currency = "PLN",
+      quantity,
+      unit = "t",
+      specs = {},
+      notes = "",
+    } = req.body;
+
+    if (!category || !commodity) {
+      return res.status(400).json({ error: "Missing category or commodity" });
+    }
+
+    const input = {
+      category,
+      commodity,
+      region,
+      currency,
+      quantity,
+      unit,
+      specs,
+      notes,
+    };
+
+    const system = `
+You are PlainGrain listing assistant.
+Return ONLY valid JSON. No markdown. No extra text.
+
+JSON format:
+{
+  "description": "string",
+  "priceSuggestion": { "value": number, "currency": "PLN|EUR", "unit": "t|kg" },
+  "confidence": "low|medium|high",
+  "missingFields": ["string", ...]
+}
+
+Rules:
+- Write a premium, short B2B description (concrete, factual).
+- Suggest a realistic price PER UNIT (e.g. PLN per ton).
+- If not enough data for price, still give an estimate but set confidence to "low" and list missingFields.
+`;
+
+    const user = `
+Create:
+1) A ready-to-paste listing description
+2) A price suggestion (per unit)
+
+INPUT:
+${JSON.stringify(input, null, 2)}
+`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.3,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    });
+
+    const raw = completion.choices?.[0]?.message?.content || "{}";
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = {
+        description: "",
+        priceSuggestion: { value: 0, currency, unit },
+        confidence: "low",
+        missingFields: ["AI returned invalid JSON - try again"],
+      };
+    }
+
+    // Basic hardening in case model returns weird shapes
+    if (
+      !parsed?.priceSuggestion ||
+      typeof parsed.priceSuggestion.value !== "number"
+    ) {
+      parsed.priceSuggestion = { value: 0, currency, unit };
+      parsed.confidence = parsed.confidence || "low";
+      parsed.missingFields = Array.isArray(parsed.missingFields)
+        ? parsed.missingFields
+        : [];
+      parsed.missingFields.push("Valid priceSuggestion.value missing");
+    }
+
+    res.json({ success: true, ...parsed });
+  } catch (err) {
+    console.error("❌ [LISTING SUGGEST ERROR]", err);
+    res.status(500).json({ error: "Listing suggestion failed" });
   }
 });
 
