@@ -57,11 +57,9 @@ app.get("/health", async (req, res) => {
 
 function verifySecret(req, res, next) {
   const header = req.headers["x-pg-secret"];
-
   if (!header || header !== SECRET) {
     return res.status(403).json({ error: "Unauthorized" });
   }
-
   next();
 }
 
@@ -185,7 +183,7 @@ Transactions: ${transactions.rowCount}
 
 User message:
 ${message}
-`;
+`.trim();
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -219,7 +217,7 @@ ${message}
  *   category, commodity, region, currency, quantity, unit,
  *   language?: "pl"|"en",
  *   specs: {...},
- *   notes?: string
+ *   notes?: string   // if provided and long enough, AI rewrites it professionally
  * }
  *
  * Returns:
@@ -249,6 +247,10 @@ app.post("/agent/listing-suggest", verifySecret, async (req, res) => {
       return res.status(400).json({ error: "Missing category or commodity" });
     }
 
+    // Treat notes as "user typed description" if long enough -> rewrite mode
+    const userDescription = String(notes || "").trim();
+    const hasUserText = userDescription.length >= 20;
+
     const input = {
       category,
       commodity,
@@ -258,11 +260,13 @@ app.post("/agent/listing-suggest", verifySecret, async (req, res) => {
       unit,
       language,
       specs,
-      notes,
+      userDescription,
+      hasUserText,
     };
 
     const system = `
-You are PlainGrain listing assistant.
+You are a professional agricultural commodities sales copywriter for the EU/Poland B2B market.
+
 Return ONLY valid JSON (no markdown, no extra text).
 
 JSON format:
@@ -273,16 +277,25 @@ JSON format:
   "missingFields": ["string", ...]
 }
 
-Rules:
-- Write in Polish if language = "pl", otherwise English.
-- Description must be short, factual, B2B, ready to paste.
-- Suggest a realistic price PER UNIT (e.g., PLN per ton).
-- If not enough data for pricing, still provide an estimate but set confidence="low" and list missingFields.
+DESCRIPTION RULES:
+- Write in Polish if language="pl", otherwise English.
+- The description MUST be 4–8 sentences and read like a real commercial offer (not just specs).
+- Always include:
+  1) 2–3 general sentences about the commodity, quality, and market suitability (easy to read)
+  2) suggested use-cases matching the commodity (e.g., milling / feed / processing / export)
+  3) short specs summary (1–2 sentences max; weave numbers naturally, do not bullet-list)
+  4) logistics/storage readiness (availability, loading, storage conditions, region/location)
+- If hasUserText=true, rewrite userDescription professionally first (keep meaning), then enrich it into a full B2B offer and incorporate key specs.
+
+STRICT:
+- Do NOT invent certifications, guarantees, lab results, origin claims, or “certified” statements unless explicitly present in input.
+- If an important detail is missing (e.g., exact grade, delivery terms), do not guess—add it to missingFields.
 `.trim();
 
     const user = `
+TASK:
 Create:
-1) description suggestion
+1) listing description (commercial offer)
 2) price suggestion (per unit)
 
 INPUT:
@@ -291,7 +304,7 @@ ${JSON.stringify(input, null, 2)}
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0.3,
+      temperature: 0.45, // higher for better copywriting, still stable
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -344,6 +357,14 @@ ${JSON.stringify(input, null, 2)}
       parsed.description = "";
       parsed.confidence = "low";
       parsed.missingFields.push("Description missing");
+    }
+
+    // Soft guard: if AI returned too short description, mark low confidence
+    if (parsed.description.trim().length < 140) {
+      parsed.confidence = "low";
+      if (!parsed.missingFields.includes("Description too short")) {
+        parsed.missingFields.push("Description too short");
+      }
     }
 
     res.json({ success: true, ...parsed });
